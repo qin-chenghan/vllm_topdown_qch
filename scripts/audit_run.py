@@ -381,6 +381,8 @@ def verify_placement(
     require(all(a < b for a, b in pairwise(times)), "placement times not ordered")
     if location != folder:
         rpc = evidence.json(location / "worker.json")
+        if isinstance(rpc, list):
+            rpc = rpc[0]
         require(
             rpc.get("pid") == rpc.get("tid") == identity["worker"],
             "shared RPC Worker mismatch",
@@ -536,6 +538,8 @@ def verify_runtime(
                 ("stop.json", "disabled"),
             ):
                 rpc = evidence.json(folder / filename)
+                if isinstance(rpc, list):
+                    rpc = rpc[0]
                 require(
                     rpc.get("pid") == rpc.get("tid") == worker,
                     f"{filename} Worker PID/TID mismatch",

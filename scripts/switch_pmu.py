@@ -30,7 +30,7 @@ def switch(
     identity_path: Path,
     stop: bool,
     timeout: float,
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     mode = "disabled" if stop else os.environ["KPERF_MODE"]
     kwargs = {"mode": mode, "round_id": round_id}
     if not stop:
@@ -50,28 +50,37 @@ def switch(
         timeout,
     )
     results = response["results"]
-    if len(results) != 1:
-        raise RuntimeError("This report requires one model execution worker")
-    result = results[0]
-    if result["round_id"] != round_id or result["mode"] != mode:
-        raise RuntimeError("Worker did not confirm the requested collection round")
+    # ⚠️ TP=4 适配(2026-10-19): /collective_rpc 广播到全部 TP worker, 每个 worker
+    #   各自 perf_event_open 并确认; 期望数量由 KPERF_EXPECTED_WORKERS(=TP*DP)给出。
+    expected_workers = int(os.environ.get("KPERF_EXPECTED_WORKERS", "1"))
+    if len(results) != expected_workers:
+        raise RuntimeError(
+            f"Expected {expected_workers} model execution workers, "
+            f"got {len(results)}"
+        )
     expected_events = [
         int(code, 0) for code in kwargs.get("codes", "").split(",") if code.strip()
     ]
     expected_names = [
         name.strip() for name in kwargs.get("names", "").split(",") if name.strip()
     ]
-    if result["events"] != expected_events or result["names"] != expected_names:
-        raise RuntimeError("Worker confirmed a different event group")
-    identity = {key: result[key] for key in ("pid", "tid")}
+    for result in results:
+        if result["round_id"] != round_id or result["mode"] != mode:
+            raise RuntimeError("Worker did not confirm the requested collection round")
+        if result["events"] != expected_events or result["names"] != expected_names:
+            raise RuntimeError("Worker confirmed a different event group")
+    identities = sorted(
+        ({key: result[key] for key in ("pid", "tid")} for result in results),
+        key=lambda identity: (identity["pid"], identity["tid"]),
+    )
     if identity_path.exists():
-        if json.loads(identity_path.read_text()) != identity:
-            raise RuntimeError("Model execution PID/TID changed between rounds")
+        if json.loads(identity_path.read_text()) != identities:
+            raise RuntimeError("Model execution PID/TID set changed between rounds")
     else:
-        identity_path.write_text(json.dumps(identity) + "\n")
+        identity_path.write_text(json.dumps(identities) + "\n")
     if not stop:
         post(f"{base_url}/resume", {}, timeout)
-    return result
+    return results
 
 
 def main() -> None:

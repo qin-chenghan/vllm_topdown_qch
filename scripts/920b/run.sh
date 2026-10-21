@@ -50,28 +50,38 @@ RUNTIME=$(mktemp -d /tmp/vllm.XXXXXX)
 source "$COMMON_DIR/session.sh"
 cp -rs "$VLLM_SITE" "$RUNTIME/vllm"
 # ⚠️ topdown 适配(2026-09-22): runtime 以容器 0.23 站点为基底, 只覆盖端到端插桩文件。
-#   仓库源码 vllm/ 是 v0.26 基座(含 gguf_utils.py 等 0.26 新增文件及其无条件 `import gguf`),
-#   容器 0.23 环境没装 gguf, 若把整个仓库源码注入 runtime 会 ModuleNotFoundError: gguf。
 #   端到端 topdown 插桩只改 gpu_worker.py(execute_model->sample_tokens) + kperf_instrument.py,
 #   因此这里仅覆盖这两个文件, 其余保持容器 0.23 原版。
-OVERRIDES=(
+# ⚠️ 2026-10-19: 提交 7cb464aa2 将整棵 vLLM 树拷入 vllm/(包体移到 vllm/vllm/),
+#   原源路径 vllm/v1/worker/gpu_worker.py 自此不存在, 覆盖被 [[ -e ]] 静默跳过。
+#   两种布局都尝试, 覆盖目标(runtime 内的包路径)固定不变。
+OVERRIDE_TARGET="vllm/v1/worker/gpu_worker.py"
+OVERRIDE_SOURCES=(
     "vllm/v1/worker/gpu_worker.py"
+    "vllm/vllm/v1/worker/gpu_worker.py"
 )
-for rel in "${OVERRIDES[@]}"; do
+for rel in "${OVERRIDE_SOURCES[@]}"; do
     file="$SOURCE_ROOT/$rel"
     if [[ -e "$file" ]]; then
-        target="$RUNTIME/$rel"
+        target="$RUNTIME/$OVERRIDE_TARGET"
         mkdir -p "$(dirname "$target")"
         ln -sfn "$file" "$target"
+        break
     fi
 done
 ln -s "$SOURCE_ROOT/kperf_instrument.py" "$RUNTIME/kperf_instrument.py"
 export SOURCE_ROOT VLLM_PYTHONPATH=$RUNTIME
 
+# ⚠️ 对齐 vllmBench_lite(2026-10-19): runner 环境变量留空不传(空串会被 vLLM 布尔解析拒绝)。
+RUNTIME_ENV=()
+if [[ -n "${VLLM_USE_V2_MODEL_RUNNER:-}" ]]; then
+    RUNTIME_ENV+=(VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER")
+fi
+if [[ -n "${VLLM_USE_V1:-}" ]]; then RUNTIME_ENV+=(VLLM_USE_V1="$VLLM_USE_V1"); fi
 RUNTIME_COMMAND=(
     env
     PYTHONPATH="$VLLM_PYTHONPATH"
-    VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER"
+    "${RUNTIME_ENV[@]}"
     "$PYTHON_BIN" -c
     'import os, sys, torch, vllm; from vllm.v1.worker.gpu import model_runner; from vllm.model_executor.models import qwen3; print(sys.version); print(vllm.__version__); print(torch.__version__); print(os.path.realpath(vllm.__file__)); print(os.path.realpath(model_runner.__file__)); print(os.path.realpath(qwen3.__file__))'
 )
@@ -82,7 +92,9 @@ record_command "runtime identity" "$RUN_ROOT/runtime.txt" 0 0 \
 # ⚠️ 2026-09-29: hotspot/perf 档已禁用(只做端到端 PMU)。此段已移除,
 #   即使 COLLECTION_PROFILE 曾被设为 hotspot 也不会触发热点采 perf。
 
-EXPECTED_CALLS=$(( RANDOM_OUTPUT_LEN - 1 ))
+# ⚠️ 对齐 vllmBench 批量负载(2026-10-19): decode 步数取决于并发/调度/预热, 无法预知;
+#   默认 0 = parse_run 跳过精确数量校验(仅保留 raw/selected/invalid 的基本检查)。
+EXPECTED_CALLS=${EXPECTED_CALLS:-0}
 start_session
 END_TO_END_STAGE=execute_model_to_sample_tokens
 END_TO_END_ROOT="$RUN_ROOT/end_to_end"

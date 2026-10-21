@@ -30,17 +30,18 @@ ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 PMU_ROW_PATTERN = re.compile(
     r"KPERF,(?P<stage>" + "|".join(map(re.escape, ALL_STAGES)) + r"),"
     r"(?P<call>\d+),(?P<enabled>\d+),(?P<running>\d+),"
-    r"(?P<valid>[01]),(?P<counts>\d+(?:,\d+)*)\s*$"
+    r"(?P<valid>[01]),(?P<counts>\d+(?:,\d+)*)"
+    r"(?:,w(?P<pid>\d+))?\s*$"
 )
 TIME_ROW_PATTERN = re.compile(
     r"KPERF_TIME,(?P<stage>" + "|".join(map(re.escape, ALL_STAGES)) + r"),"
     r"(?P<call>\d+),(?P<wall_ns>\d+),(?P<thread_ns>\d+),"
-    r"(?P<valid>[01])\s*$"
+    r"(?P<valid>[01])(?:,w(?P<pid>\d+))?\s*$"
 )
 QUALIFIER_PATTERN = re.compile(
     r"KPERF_QUALIFIER,(?P<stage>"
     + "|".join(map(re.escape, ALL_STAGES))
-    + r"),(?P<call>\d+),(?P<qualifier>[^,\s]+)\s*$"
+    + r"),(?P<call>\d+),(?P<qualifier>[^,\s]+)(?:,w(?P<pid>\d+))?\s*$"
 )
 
 
@@ -76,6 +77,8 @@ def parse_rows(
         row: dict[str, object] = {
             "sequence": len(rows[stage]) + 1,
             "global_call": int(match.group("call")),
+            # ⚠️ TP=4 适配(2026-10-19): KPERF 行尾的 worker pid; 旧格式无此字段 → 空。
+            "worker": match.group("pid") or "",
             "valid": int(match.group("valid")),
         }
         if mode == "time":
@@ -209,11 +212,12 @@ def quality_status(
         return "no_decode_rows"
     if expected_raw is not None and raw_count != expected_raw:
         return "raw_count_changed"
-    if qualifier_count is not None and qualifier_count != expected:
+    if qualifier_count is not None and expected and qualifier_count != expected:
         return "qualifier_count_changed"
     if invalid_count:
         return "invalid_rows"
-    if selected_count != expected or valid_count != expected:
+    # expected=0(批量负载, decode 步数不可预知)时跳过精确数量校验。
+    if expected and (selected_count != expected or valid_count != expected):
         return "count_changed"
     return "ok"
 
@@ -244,7 +248,7 @@ def write_csvs(
         decode_rows = select_decode_rows(rows)
         expected_raw = None
         qualifier_count = None
-    headers = ["sequence", "global_call"]
+    headers = ["sequence", "global_call", "worker"]
     if mode == "time":
         headers.extend(
             ["wall_time_us", "thread_cpu_time_us", "cpu_utilization", "valid"]

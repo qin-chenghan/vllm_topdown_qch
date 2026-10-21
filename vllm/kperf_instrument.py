@@ -470,11 +470,13 @@ def kperf_finish(name: str) -> None:
                     str(wall_ns),
                     str(thread_ns),
                     str(valid),
+                    # ⚠️ TP=4 适配(2026-10-19): 行尾带 worker pid, parse_run 据此分 worker。
+                    f"w{os.getpid()}",
                 )
             )
         )
         if QUALIFIED:
-            emit(f"KPERF_QUALIFIER,{NAME},{CALL},{QUALIFIER_STAGE}")
+            emit(f"KPERF_QUALIFIER,{NAME},{CALL},{QUALIFIER_STAGE},w{os.getpid()}")
         QUALIFIED = False
         return
     if not COUNTER_GROUPS:
@@ -522,10 +524,12 @@ def kperf_finish(name: str) -> None:
         str(time_running),
         str(valid),
         *(str(count) for count in counts),
+        # ⚠️ TP=4 适配(2026-10-19): 行尾带 worker pid, parse_run 据此分 worker。
+        f"w{os.getpid()}",
     ]
     emit(",".join(fields))
     if QUALIFIED:
-        emit(f"KPERF_QUALIFIER,{NAME},{CALL},{QUALIFIER_STAGE}")
+        emit(f"KPERF_QUALIFIER,{NAME},{CALL},{QUALIFIER_STAGE},w{os.getpid()}")
     QUALIFIED = False
 
 

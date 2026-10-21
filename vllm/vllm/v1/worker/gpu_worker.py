@@ -832,17 +832,30 @@ class Worker(WorkerBase):
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # kperf: 端到端采集窗口 (execute_model -> sample_tokens)
-        # ⚠️ 0.23 适配(2026-09-22): 只统计 decode 稳态轮, 排除 prefill。
-        #   原 collect 条件 total_num_scheduled_tokens>0 会把 prefill 也计入,
-        #   而 0.23 无 8 阶段/run_fullgraph qualifier, parse_run 无法用它筛 decode。
-        #   本采集配置为单请求(NUM_PROMPTS=1/MAX_CONCURRENCY=1): decode 轮进来时
-        #   total_num_scheduled_tokens == 1(每请求每步 1 token), prefill 轮为 input_len。
-        #   因此仅当 ==1 才收集端到端样本, 使 raw=decode 数(OUTPUT_LEN-1)。
-        collect = getattr(scheduler_output, "total_num_scheduled_tokens", 0) == 1
+        # ⚠️ 对齐 vllmBench 批量负载(2026-10-19): decode 稳态步 = 本步所有请求
+        #   都只调度 1 个 token(纯 decode, 排除 prefill/chunked prefill 混合步)。
+        #   原条件 total_num_scheduled_tokens==1 仅适用于单请求负载
+        #   (NUM_PROMPTS=1/MAX_CONCURRENCY=1); 批量并发下 decode 步为每请求 1 token,
+        #   prefill 步为 input_len(或其 chunk), 混合步两者兼有。
+        scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
+        if scheduled:
+            collect = all(tokens == 1 for tokens in scheduled.values())
+        else:
+            collect = (
+                getattr(scheduler_output, "total_num_scheduled_tokens", 0) == 1
+            )
         if collect:
             kperf_span_begin(KPERF_END_TO_END_STAGE)
         try:
-            return self._execute_model_inner(scheduler_output)
+            output = self._execute_model_inner(scheduler_output)
+            # 窗口收口有两条路径, 恰好触发一次:
+            #   1) execute_model 返回非 None: 采样已在内部完成(V1 runner/非 deferral),
+            #      此处收口; 引擎不会再调 sample_tokens(core.py: model_output is None
+            #      才调)。
+            #   2) 返回 None(异步调度 deferral): 由下方 sample_tokens 的 finally 收口。
+            if collect and output is not None:
+                kperf_span_finish(KPERF_END_TO_END_STAGE)
+            return output
         except Exception:
             if collect:
                 kperf_span_finish(KPERF_END_TO_END_STAGE)

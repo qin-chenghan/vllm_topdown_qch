@@ -177,31 +177,67 @@ CUDA_GRAPH_ARGS=()
 if [[ -n "${CUDA_GRAPH_COMPILATION:-}" ]]; then
     CUDA_GRAPH_ARGS=(--compilation-config "$CUDA_GRAPH_COMPILATION")
 fi
+# ⚠️ 对齐 vllmBench_lite(2026-10-19): config.env 留空的参数不传, 走 vLLM 默认。
+BLOCK_SIZE_ARGS=()
+if [[ -n "${BLOCK_SIZE:-}" ]]; then BLOCK_SIZE_ARGS=(--block-size "$BLOCK_SIZE"); fi
+MAX_NUM_SEQS_ARGS=()
+if [[ -n "${MAX_NUM_SEQS:-}" ]]; then MAX_NUM_SEQS_ARGS=(--max-num-seqs "$MAX_NUM_SEQS"); fi
+MAX_BATCHED_TOKENS_ARGS=()
+if [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]]; then
+    MAX_BATCHED_TOKENS_ARGS=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
+fi
+DTYPE_ARGS=()
+if [[ -n "${DTYPE:-}" ]]; then DTYPE_ARGS=(--dtype "$DTYPE"); fi
+QUANTIZATION_ARGS=()
+if [[ -n "${QUANTIZATION:-}" ]]; then QUANTIZATION_ARGS=(--quantization "$QUANTIZATION"); fi
+CHUNKED_PREFILL_ARGS=()
+if [[ "${ENABLE_CHUNKED_PREFILL:-0}" == 1 ]]; then
+    CHUNKED_PREFILL_ARGS=(--enable-chunked-prefill)
+fi
+TRUST_REMOTE_CODE_ARGS=()
+if [[ "${TRUST_REMOTE_CODE:-0}" == 1 ]]; then
+    TRUST_REMOTE_CODE_ARGS=(--trust-remote-code)
+fi
+SERVER_SEED_ARGS=()
+if [[ -n "${SERVER_SEED:-}" ]]; then SERVER_SEED_ARGS=(--seed "$SERVER_SEED"); fi
+SERVED_MODEL_ARGS=()
+if [[ -n "${SERVED_MODEL:-}" ]]; then
+    SERVED_MODEL_ARGS=(--served-model-name "$SERVED_MODEL")
+fi
+# Runner 环境: 留空不传(空串会被 vLLM 的布尔解析拒绝)。
+RUNNER_ENV=()
+if [[ -n "${VLLM_USE_V2_MODEL_RUNNER:-}" ]]; then
+    RUNNER_ENV+=(VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER")
+fi
+if [[ -n "${VLLM_USE_V1:-}" ]]; then RUNNER_ENV+=(VLLM_USE_V1="$VLLM_USE_V1"); fi
 
 SERVER_COMMAND=(
     setsid "${SERVER_PREFIX[@]}" env
     PYTHONUNBUFFERED=1
     PYTHONPATH="$VLLM_PYTHONPATH"
     CUDA_VISIBLE_DEVICES="$GPU_ID"
-    VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER"
+    "${RUNNER_ENV[@]}"
     VLLM_ENFORCE_CUDA_GRAPH="${VLLM_ENFORCE_CUDA_GRAPH:-1}"
     "${KPERF_ENV[@]}"
     "$VLLM_BIN" serve "$MODEL"
-    --served-model-name "$SERVED_MODEL"
+    "${SERVED_MODEL_ARGS[@]}"
     --host "$SERVER_HOST"
     --port "$PORT"
-    --block-size "$BLOCK_SIZE"
+    "${BLOCK_SIZE_ARGS[@]}"
     --max-model-len "$MAX_MODEL_LEN"
-    --max-num-seqs "$MAX_NUM_SEQS"
-    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
+    "${MAX_NUM_SEQS_ARGS[@]}"
+    "${MAX_BATCHED_TOKENS_ARGS[@]}"
     --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
     --data-parallel-size "$DATA_PARALLEL_SIZE"
-    --dtype "$DTYPE"
+    "${DTYPE_ARGS[@]}"
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+    "${QUANTIZATION_ARGS[@]}"
+    "${CHUNKED_PREFILL_ARGS[@]}"
     "${PREFIX_CACHING_ARGS[@]}"
-    --seed "$SERVER_SEED"
+    "${SERVER_SEED_ARGS[@]}"
     "${EXTRA_SERVER_FLAGS[@]}"
     "${CUDA_GRAPH_ARGS[@]}"
+    "${TRUST_REMOTE_CODE_ARGS[@]}"
     "${BINDING_ARGS[@]}"
 )
 if [[ -z "$SESSION_DIR" || "$LABEL" == service ]]; then
@@ -255,8 +291,12 @@ placement_check check
 START_LINE=$(( $(wc -l < "$SERVICE_LOG") + 1 ))
 ROUND_START_LINE=$START_LINE
 if [[ -n "$SESSION_DIR" ]]; then
+    # ⚠️ TP=4 适配(2026-10-19): /collective_rpc 返回全部 TP*DP 个 worker 的确认,
+    #   switch_pmu.py 按 KPERF_EXPECTED_WORKERS 校验数量。
+    KPERF_EXPECTED_WORKERS=$(( TENSOR_PARALLEL_SIZE * DATA_PARALLEL_SIZE ))
     SWITCH_COMMAND=(
         env "${KPERF_ENV[@]}" KPERF_MODE="$COLLECT_MODE"
+        KPERF_EXPECTED_WORKERS="$KPERF_EXPECTED_WORKERS"
         "$PYTHON_BIN" "$SCRIPT_DIR/switch_pmu.py"
         "http://${SERVER_HOST}:${PORT}" "$RUN_DIR" "$SESSION_DIR/worker.json"
         --timeout "$(( READY_CHECK_ATTEMPTS * READY_CHECK_INTERVAL ))"
@@ -264,7 +304,7 @@ if [[ -n "$SESSION_DIR" ]]; then
     record_command "$LABEL switch PMU" "$RUN_DIR/switch.json" 1 0 "${SWITCH_COMMAND[@]}"
     "${SWITCH_COMMAND[@]}" > "$RUN_DIR/switch.json"
     if [[ "$PLACEMENT_MODE" == worker_set ]]; then
-        "$PYTHON_BIN" -c 'import json,sys; a=json.load(open(sys.argv[1])); b=json.load(open(sys.argv[2])); assert a["pid"] == a["tid"] == b["worker"], "RPC Worker identity mismatch"' \
+        "$PYTHON_BIN" -c 'import json,sys; a=json.load(open(sys.argv[1])); b=json.load(open(sys.argv[2])); assert len(a) == 1 and a[0]["pid"] == a[0]["tid"] == b["worker"], "RPC Worker identity mismatch"' \
             "$SESSION_DIR/worker.json" "$BIND_IDENTITY"
     fi
     placement_check check
@@ -318,30 +358,53 @@ if [[ "$LABEL" == hotspot ]]; then
     sleep "$PERF_SETTLE_SECONDS"
 fi
 
+# ⚠️ 对齐 vllmBench_lite off 档(2026-10-19): --backend vllm + --host/--port 直连,
+#   flag 拼写沿用 vllmBench_lite 原样(下划线); config.env 留空的参数不传, 走默认。
+RANGE_RATIO_ARGS=()
+if [[ -n "${RANDOM_RANGE_RATIO:-}" ]]; then
+    RANGE_RATIO_ARGS=(--random_range_ratio "$RANDOM_RANGE_RATIO")
+fi
+REQUEST_RATE_ARGS=()
+if [[ -n "${REQUEST_RATE:-}" ]]; then REQUEST_RATE_ARGS=(--request_rate "$REQUEST_RATE"); fi
+READY_TIMEOUT_ARGS=()
+if [[ -n "${READY_CHECK_TIMEOUT_SEC:-}" ]]; then
+    READY_TIMEOUT_ARGS=(--ready-check-timeout-sec "$READY_CHECK_TIMEOUT_SEC")
+fi
+TOP_P_ARGS=()
+if [[ -n "${TOP_P:-}" ]]; then TOP_P_ARGS=(--top_p "$TOP_P"); fi
+TOP_K_ARGS=()
+if [[ -n "${TOP_K:-}" ]]; then TOP_K_ARGS=(--top_k "$TOP_K"); fi
+BENCH_TRUST_ARGS=()
+if [[ "${TRUST_REMOTE_CODE:-0}" == 1 ]]; then BENCH_TRUST_ARGS=(--trust_remote_code); fi
 BENCHMARK_ARGS=(
     --backend "$BENCH_BACKEND"
-    --base-url "http://${SERVER_HOST}:${PORT}"
-    --endpoint "$BENCH_ENDPOINT"
-    --model "$SERVED_MODEL"
-    --tokenizer "$MODEL"
-    --dataset-name "$DATASET_NAME"
-    --random-input-len "$RANDOM_INPUT_LEN"
-    --random-output-len "$RANDOM_OUTPUT_LEN"
-    --random-range-ratio "$RANDOM_RANGE_RATIO"
-    --num-prompts "$NUM_PROMPTS"
-    --num-warmups "$NUM_WARMUPS"
-    --ready-check-timeout-sec "$READY_CHECK_TIMEOUT_SEC"
+    --host "$SERVER_HOST"
+    --port "$PORT"
+    --model "$MODEL"
+    --dataset_name "$DATASET_NAME"
+    --random_input_len "$RANDOM_INPUT_LEN"
+    --random_output_len "$RANDOM_OUTPUT_LEN"
+    "${RANGE_RATIO_ARGS[@]}"
+    --num_prompts "$NUM_PROMPTS"
+    --num_warmups "$NUM_WARMUPS"
     --max-concurrency "$MAX_CONCURRENCY"
-    --request-rate "$REQUEST_RATE"
+    "${REQUEST_RATE_ARGS[@]}"
+    "${READY_TIMEOUT_ARGS[@]}"
     "${IGNORE_EOS_ARGS[@]}"
+    "${TOP_P_ARGS[@]}"
+    "${TOP_K_ARGS[@]}"
     --temperature "$TEMPERATURE"
     --seed "$BENCH_SEED"
+    --save-result
+    --result-dir "$RUN_DIR"
+    --result_filename benchmark.json
+    "${BENCH_TRUST_ARGS[@]}"
 )
 BENCHMARK_COMMAND=(
     setsid "${CLIENT_PREFIX[@]}" env
     PYTHONPATH="$VLLM_PYTHONPATH"
     CUDA_VISIBLE_DEVICES="$GPU_ID"
-    VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER"
+    "${RUNNER_ENV[@]}"
     "$VLLM_BIN" bench serve
     "${BENCHMARK_ARGS[@]}"
 )
@@ -350,7 +413,7 @@ if [[ ${PERSISTENT_BENCH_CLIENT:-1} == 1 ]]; then
     install -d -m 755 "$CLIENT_STATE"
     if [[ ! -s "$CLIENT_STATE/ready.json" ]]; then
         setsid "${CLIENT_PREFIX[@]}" env PYTHONPATH="$VLLM_PYTHONPATH" \
-            CUDA_VISIBLE_DEVICES="$GPU_ID" VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER" \
+            CUDA_VISIBLE_DEVICES="$GPU_ID" "${RUNNER_ENV[@]}" \
             "$PYTHON_BIN" "$SCRIPT_DIR/bench_client.py" serve --state "$CLIENT_STATE" \
             "${BENCHMARK_ARGS[@]}" > "$CLIENT_STATE/server.log" 2>&1 &
         BENCH_SERVICE_PID=$!

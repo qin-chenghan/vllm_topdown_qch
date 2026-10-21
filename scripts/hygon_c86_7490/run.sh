@@ -67,10 +67,16 @@ export SOURCE_ROOT VLLM_PYTHONPATH=$RUNTIME
     printf 'nmi_watchdog='
     cat /proc/sys/kernel/nmi_watchdog
 } > "$RUN_ROOT/platform.txt"
+# ⚠️ runner 环境变量留空不传(空串会被 vLLM 布尔解析拒绝), 同 920b/run.sh。
+RUNTIME_ENV=()
+if [[ -n "${VLLM_USE_V2_MODEL_RUNNER:-}" ]]; then
+    RUNTIME_ENV+=(VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER")
+fi
+if [[ -n "${VLLM_USE_V1:-}" ]]; then RUNTIME_ENV+=(VLLM_USE_V1="$VLLM_USE_V1"); fi
 RUNTIME_COMMAND=(
     env
     PYTHONPATH="$VLLM_PYTHONPATH"
-    VLLM_USE_V2_MODEL_RUNNER="$VLLM_USE_V2_MODEL_RUNNER"
+    "${RUNTIME_ENV[@]}"
     "$PYTHON_BIN" -c
     'import os, sys, torch, vllm; from vllm.v1.worker.gpu import model_runner; from vllm.model_executor.models import qwen3; print(sys.version); print(vllm.__version__); print(torch.__version__); print(os.path.realpath(vllm.__file__)); print(os.path.realpath(model_runner.__file__)); print(os.path.realpath(qwen3.__file__))'
 )

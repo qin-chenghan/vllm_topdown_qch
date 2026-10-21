@@ -165,7 +165,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def read_rows(root: Path, group: str, stage: str) -> list[dict[str, str]]:
+def read_rows(
+    root: Path, group: str, stage: str, worker: str | None = None
+) -> list[dict[str, str]]:
     path = root / group / "parsed" / f"{stage}.csv"
     if not path.is_file():
         # ⚠️ 0.23 适配(2026-09-22): 8 阶段(非端到端)无采集数据, 文件缺失时返回空而非报错。
@@ -180,6 +182,10 @@ def read_rows(root: Path, group: str, stage: str) -> list[dict[str, str]]:
             for row in csv.DictReader(handle)
             if row["valid"] == "1"
         ]
+    # ⚠️ TP=4 适配(2026-10-19): 按 worker 列过滤; 旧数据无 worker 列时
+    #   每行 worker 为空, 指定具体 worker 会得到空集(只有 all 列有数)。
+    if worker is not None:
+        rows = [row for row in rows if (row.get("worker") or "") == worker]
     # ⚠️ 2026-09-29: 端到端(execute_model_to_sample_tokens)模式下, 第一个样本
     #   (global_call=1) 是 prefill+首 token, cycles 约为其余稳态 decode 样本的 ~52 倍
     #   (实测 row1 4.15G vs 单个 decode ~78M), 占端到端全样本 cycles ~34%,
@@ -268,35 +274,37 @@ def latency_proxy(
     return ((access_sum - refill_sum) * 15 + refill_sum * 100) / cycle_sum
 
 
-def stage_metrics(root: Path, stage: str) -> dict[str, float | None]:
-    timing = read_rows(root, "time", stage)
-    topdown = read_rows(root, "topdown", stage)
-    flush = read_rows(root, "flush", stage)
-    badspec_branch = read_rows(root, "badspec_branch", stage)
-    backend_core = read_rows(root, "backend_core", stage)
-    backend_memory = read_rows(root, "backend_memory", stage)
-    imix = read_rows(root, "imix", stage)
-    imix2 = read_rows(root, "imix2", stage)
-    branch = read_rows(root, "branch", stage)
-    icache = read_rows(root, "icache", stage)
-    dcache = read_rows(root, "dcache", stage)
-    l3 = read_rows(root, "l3", stage)
-    tlb1 = read_rows(root, "tlb1", stage)
-    tlb2 = read_rows(root, "tlb2", stage)
+def stage_metrics(
+    root: Path, stage: str, worker: str | None = None
+) -> dict[str, float | None]:
+    timing = read_rows(root, "time", stage, worker)
+    topdown = read_rows(root, "topdown", stage, worker)
+    flush = read_rows(root, "flush", stage, worker)
+    badspec_branch = read_rows(root, "badspec_branch", stage, worker)
+    backend_core = read_rows(root, "backend_core", stage, worker)
+    backend_memory = read_rows(root, "backend_memory", stage, worker)
+    imix = read_rows(root, "imix", stage, worker)
+    imix2 = read_rows(root, "imix2", stage, worker)
+    branch = read_rows(root, "branch", stage, worker)
+    icache = read_rows(root, "icache", stage, worker)
+    dcache = read_rows(root, "dcache", stage, worker)
+    l3 = read_rows(root, "l3", stage, worker)
+    tlb1 = read_rows(root, "tlb1", stage, worker)
+    tlb2 = read_rows(root, "tlb2", stage, worker)
 
     # 精细化分支/BTB 三组 (2026-09-26)
-    br_imm = read_rows(root, "br_imm", stage)
-    br_ret = read_rows(root, "br_ret", stage)
-    br_indnr = read_rows(root, "br_indnr", stage)
+    br_imm = read_rows(root, "br_imm", stage, worker)
+    br_ret = read_rows(root, "br_ret", stage, worker)
+    br_indnr = read_rows(root, "br_indnr", stage, worker)
 
     # BTB 深入分析 四组 (2026-09-26)
-    btb_hit = read_rows(root, "btb_hit", stage)
-    btb_ubtb = read_rows(root, "btb_ubtb", stage)
-    btb_fbtb = read_rows(root, "btb_fbtb", stage)
-    btb_main = read_rows(root, "btb_main", stage)
+    btb_hit = read_rows(root, "btb_hit", stage, worker)
+    btb_ubtb = read_rows(root, "btb_ubtb", stage, worker)
+    btb_fbtb = read_rows(root, "btb_fbtb", stage, worker)
+    btb_main = read_rows(root, "btb_main", stage, worker)
 
     # 预测器覆盖分析 (2026-10-09) — 组 br_spec, 全部以 0x0012(BR_PRED 总分支)为分母
-    br_spec = read_rows(root, "br_spec", stage)
+    br_spec = read_rows(root, "br_spec", stage, worker)
 
     # 分支误预测拆解 (2026-10-09) — 两组 br_mis_pred1 / br_mis_pred2
     # 中心思想: 0x0010(BR_MIS_PRED)=误预测分支总数, 作为所有细分事件的统一分母。
@@ -304,8 +312,8 @@ def stage_metrics(root: Path, stage: str) -> dict[str, float | None]:
     #   组1: IF_BP_MISP_BR_DIR(0x1004 方向) / RET(0x100d 返回) / IND(0x1010 间接非Call)
     #   组2: IF_BP_MISP_BR_BLR(0x1013 带link寄存器) / BL(0x1016 直接call) / TGT(0x1017 目标) / LP(0x1019 loop)
     # 各细分误预测占比 = 该事件 / 0x0010(同组内)。
-    br_mis_pred1 = read_rows(root, "br_mis_pred1", stage)
-    br_mis_pred2 = read_rows(root, "br_mis_pred2", stage)
+    br_mis_pred1 = read_rows(root, "br_mis_pred1", stage, worker)
+    br_mis_pred2 = read_rows(root, "br_mis_pred2", stage, worker)
 
     # 预测源拆解 (2026-10-09) — 三组 if_bp_pred_br1/2/3, 分母统一为 0x1000(IF_BP_PRED_BR 总预测)
     #   0x1000(总预测)在每组都包含, 组内自给(避免跨组相减噪声)。
@@ -313,18 +321,18 @@ def stage_metrics(root: Path, stage: str) -> dict[str, float | None]:
     #   组2: RET(0x100c 返回) / IND(0x100f 间接非Call) / BLR(0x1012 带link寄存器) / BL(0x1015 直接call)
     #   组3: LP(0x1018 loop) / FBTB(0x101d) / VBTB(0x101e)
     # 预测占比 = 该事件 / 0x1000(同组内)。
-    if_bp_pred_br1 = read_rows(root, "if_bp_pred_br1", stage)
-    if_bp_pred_br2 = read_rows(root, "if_bp_pred_br2", stage)
-    if_bp_pred_br3 = read_rows(root, "if_bp_pred_br3", stage)
+    if_bp_pred_br1 = read_rows(root, "if_bp_pred_br1", stage, worker)
+    if_bp_pred_br2 = read_rows(root, "if_bp_pred_br2", stage, worker)
+    if_bp_pred_br3 = read_rows(root, "if_bp_pred_br3", stage, worker)
 
     # 预测源结构替换/冲突/多命中 (2026-10-09) — 组 if_bp_pred_br_ubtb/fbtb/btb
     # 用户指定口径(不使用旧 btb_* 组):
     #   uBTB: 0x1002(命中)分母; 替换=0x101a/0x1002, 冲突=0x101b/0x1002
     #   fBTB: 0x101d(命中)分母; 替换=0x1021/0x101d, 多命中=0x1024/0x101d
     #   BTB : 0x1003(命中)分母; 替换=0x101c/0x1003, 多命中=0x101f/0x1003
-    if_bp_pred_br_ubtb = read_rows(root, "if_bp_pred_br_ubtb", stage)
-    if_bp_pred_br_fbtb = read_rows(root, "if_bp_pred_br_fbtb", stage)
-    if_bp_pred_br_btb = read_rows(root, "if_bp_pred_br_btb", stage)
+    if_bp_pred_br_ubtb = read_rows(root, "if_bp_pred_br_ubtb", stage, worker)
+    if_bp_pred_br_fbtb = read_rows(root, "if_bp_pred_br_fbtb", stage, worker)
+    if_bp_pred_br_btb = read_rows(root, "if_bp_pred_br_btb", stage, worker)
 
     # 定向分支指令完整失败率 (2026-10-15) — 组 br_misp_ret / br_misp_ind
     # 中心思想: BR_MIS_PRED(0x0010)=所有分支失败(含没预测但跳转 + 被预测但失败);
@@ -337,8 +345,8 @@ def stage_metrics(root: Path, stage: str) -> dict[str, float | None]:
     #   IND: 总数=0x100e, 被预测=0x100f, 被预测失败=0x1010, 全失败=0x0010
     #   BR_MISP_XXX/XXX = 失败总数 / 该指令类总数 (该指令类真失败率)
     #   BR_MISP_XXX/MISP = 失败总数 / 0x0010   (该指令类失败占全部分支失败的比例)
-    br_misp_ret = read_rows(root, "br_misp_ret", stage)
-    br_misp_ind = read_rows(root, "br_misp_ind", stage)
+    br_misp_ret = read_rows(root, "br_misp_ret", stage, worker)
+    br_misp_ind = read_rows(root, "br_misp_ind", stage, worker)
 
     # 未预测-taken 分支 (0x1009) 中 RET/IND 各自占比 (2026-10-15) — 组 unpred_tkn_sub
     # 0x1009(IF_BR_UNPRED_TKN_SPEC) = 预测器未给出预测但最终跳转的分支总数,
@@ -347,7 +355,7 @@ def stage_metrics(root: Path, stage: str) -> dict[str, float | None]:
     #     IND 未预测数 = 0x100e(总数) - 0x100f(被预测)
     #   BR_MISP_RET/UNPRED_TKN = (0x100b-0x100c) / 0x1009
     #   BR_MISP_IND/UNPRED_TKN = (0x100e-0x100f) / 0x1009
-    unpred_tkn_sub = read_rows(root, "unpred_tkn_sub", stage)
+    unpred_tkn_sub = read_rows(root, "unpred_tkn_sub", stage, worker)
     retire = ratio(topdown, ("0x0008",), ("0x0011",), 1 / 6)
     frontend = ratio(topdown, ("0x2011",), ("0x0011",), 1 / 6)
     fetch_latency = ratio(topdown, ("0x2012",), ("0x0011",))
@@ -705,29 +713,43 @@ def write_quality(root: Path) -> None:
                         )
 
 
+def discover_workers(stage_root: Path, stage: str) -> list[str]:
+    """从 end_to_end/*/parsed/{stage}.csv 的 worker 列收集出现过的 worker pid。"""
+    workers: set[str] = set()
+    for path in sorted(stage_root.glob(f"*/parsed/{stage}.csv")):
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                worker = (row.get("worker") or "").strip()
+                if worker:
+                    workers.add(worker)
+    return sorted(workers, key=int)
+
+
 def main() -> int:
     args = parse_args()
     # ⚠️ 0.23 适配(2026-09-22): 本采集只做端到端(execute_model_to_sample_tokens),
     #   8 阶段插桩已移除无条件数据。summary 只输出端到端列, 不再遍历 8 阶段。
-    report_stages = (END_TO_END_STAGE,)
+    # ⚠️ TP=4 适配(2026-10-19): KPERF 行带 worker pid → summary.csv 除汇总列(all)
+    #   外, 每个 TP worker 各出一列分开统计; 旧数据无 worker 列时只有 all 列。
+    stage_root = args.run_root / "end_to_end"
+    columns: list[tuple[str, str | None]] = [("all", None)]
+    columns.extend((f"w{worker}", worker) for worker in discover_workers(stage_root, END_TO_END_STAGE))
     values = {
-        END_TO_END_STAGE: stage_metrics(
-            args.run_root / "end_to_end",
-            END_TO_END_STAGE,
-        )
+        label: stage_metrics(stage_root, END_TO_END_STAGE, worker=worker)
+        for label, worker in columns
     }
-    metrics = list(values[END_TO_END_STAGE])
+    metrics = list(values["all"])
     output = args.run_root / "summary.csv"
     with output.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["", *report_stages])
+        writer.writerow(["", *(label for label, _ in columns)])
         for metric in metrics:
             writer.writerow(
                 [
                     metric,
                     *(
-                        format_value(metric, values[stage][metric])
-                        for stage in report_stages
+                        format_value(metric, values[label][metric])
+                        for label, _ in columns
                     ),
                 ]
             )
@@ -735,11 +757,7 @@ def main() -> int:
                 writer.writerow(
                     [
                         CYCLES_SHARE_METRIC,
-                        "不适用",
-                        *(
-                            format_value(CYCLES_SHARE_METRIC, None)
-                            for stage in report_stages
-                        ),
+                        *("不适用" for _ in columns),
                     ]
                 )
         writer.writerow([""])
@@ -748,7 +766,7 @@ def main() -> int:
                 "热点函数占比：",
                 *(
                     "见热点函数" if (args.run_root / "hotspot").exists() else "未采集"
-                    for _ in report_stages
+                    for _ in columns
                 ),
             ]
         )
